@@ -1,0 +1,7 @@
+streamlit
+deepgram-sdk
+ffmpeg-python
+pydub
+transformers
+torch
+requests
