@@ -7,8 +7,8 @@ from typing import List, Optional
 
 import streamlit as st
 import requests
-from dotenv import load_dotenv
-load_dotenv()
+
+
 
 # ============== внешние SDK ==============
 from deepgram import Deepgram
