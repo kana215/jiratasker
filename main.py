@@ -1,40 +1,20 @@
 import os
 import re
+import io
 import json
 import tempfile
-import subprocess
 from typing import List, Optional
 
 import streamlit as st
 import requests
-
-# внешние SDK
 from deepgram import Deepgram
-import imageio_ffmpeg as ioffmpeg
 
 # ================= UI / page =================
 st.set_page_config(page_title="ИИ-секретарь", page_icon="🤖", layout="wide")
 st.title("🤖 ИИ-секретарь для онлайн-встреч")
 
 # ================= helpers =================
-def ffmpeg_convert_to_wav(src_path: str, wav_path: str, sr: int = 16000) -> None:
-    """Любой аудио/видео → WAV 16k mono через ffmpeg (бинарник берём из imageio-ffmpeg)."""
-    ffmpeg_bin = ioffmpeg.get_ffmpeg_exe()  # гарантированно есть на Streamlit Cloud
-    cmd = [
-        ffmpeg_bin, "-hide_banner", "-y",
-        "-i", src_path,
-        "-vn",
-        "-acodec", "pcm_s16le",
-        "-ar", str(sr),
-        "-ac", "1",
-        wav_path,
-    ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        raise RuntimeError("FFmpeg conversion failed: " + proc.stderr.decode(errors="ignore")[:800])
-
 def detect_lang_code(text: str) -> str:
-    """Грубое определение языка по наличию кириллицы."""
     cyr = sum('а' <= ch.lower() <= 'я' or ch == 'ё' for ch in text)
     lat = sum('a' <= ch.lower() <= 'z' for ch in text)
     return "ru" if cyr > lat else "en"
@@ -54,11 +34,9 @@ def expand_compounds(s: str) -> List[str]:
             out.append(frag)
     return out or [s]
 
-# базовый список глаголов-триггеров (RU/EN)
 VERB_RE = r"(провести|подготовить|отправить|создать|написать|проверить|созвониться|добавить|исправить|закрыть|запланировать|согласовать|обновить|описать|развернуть|подключить|оформить|назначить|организовать|презентовать|ожидать|собрать|дать|выполнить|подтвердить|утвердить|поделиться|скинуть|зафиксировать|напомнить|подвести итоги|review|plan|schedule|deploy|implement|prepare|send|create|write|check|fix|update|investigate|present|follow up)"
 
 def candidate_actions(text: str) -> List[str]:
-    """Выделяем кандидатов на задачи: только фразы с глаголами-триггерами."""
     out = []
     for s in split_sentences(text):
         if not re.search(VERB_RE, s, flags=re.IGNORECASE):
@@ -79,18 +57,10 @@ def candidate_actions(text: str) -> List[str]:
             res.append(t); seen.add(t)
     return res
 
-# ============== NLI-фильтр (HuggingFace) ==============
 @st.cache_resource(show_spinner=False)
 def load_nli_models():
-    """
-    Загружаем две бесплатные модели (скачаются 1 раз):
-    - RU: cointegrated/rubert-base-cased-nli-threeway
-    - EN: facebook/bart-large-mnli
-    Если в папке models/nli-ru или models/nli-en лежат локальные копии — используем их.
-    """
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     models = {}
-
     ru_dir = "models/nli-ru"
     ru_name = "cointegrated/rubert-base-cased-nli-threeway"
     try:
@@ -118,11 +88,9 @@ def load_nli_models():
 import torch
 
 def nli_is_task(premise: str, lang: str, models, threshold: float = 0.60) -> bool:
-    """Проверяем гипотезу 'это поручение/task' через NLI. True, если entailment >= threshold."""
     pair = models.get("ru" if lang == "ru" else "en")
     if not pair:
-        return True  # нет модели → не фильтруем
-
+        return True
     tok, mdl = pair
     hypothesis = "Это конкретное поручение, которое нужно выполнить." if lang == "ru" else \
                  "This is an actionable task to be done."
@@ -130,7 +98,7 @@ def nli_is_task(premise: str, lang: str, models, threshold: float = 0.60) -> boo
     with torch.no_grad():
         logits = mdl(**inputs).logits[0]
     probs = torch.softmax(logits, dim=-1)
-    entail_p = float(probs[-1])  # последний — entailment
+    entail_p = float(probs[-1])
     return entail_p >= threshold
 
 def extract_tasks_with_nli(text: str) -> List[str]:
@@ -152,7 +120,6 @@ def extract_tasks_with_nli(text: str) -> List[str]:
             if c2:
                 out.append(c2)
         bar.progress(i/total)
-    # дедуп
     seen, res = set(), []
     for t in out:
         if t and t not in seen:
@@ -164,7 +131,6 @@ def _adf_paragraph(text: str):
 
 def create_jira_task(base_url: str, email: str, token: str, project_key: str,
                      summary: str, description: Optional[str] = None) -> str:
-    """Создаём задачу в Jira Cloud (API v3) c ADF-описанием."""
     url = f"{base_url.rstrip('/')}/rest/api/3/issue"
     auth = (email, token)
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -201,32 +167,64 @@ up = st.file_uploader(
 if up:
     st.audio(up.getvalue())
     if st.button("🎙️ Распознать и выделить задачи"):
-        # сохраняем и конвертим
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(up.name)[1]) as tmp:
-            tmp.write(up.getvalue())
-            src_path = tmp.name
-        wav_path = src_path + ".wav"
-
-        with st.spinner("Конвертация в WAV (16kHz mono)…"):
-            ffmpeg_convert_to_wav(src_path, wav_path)
-
-        # Deepgram ключ из Streamlit Secrets (или из env для локалки)
+        # Deepgram ключ из Secrets/ENV
         DG_KEY = st.secrets.get("DEEPGRAM_API_KEY") or os.getenv("DEEPGRAM_API_KEY")
         if not DG_KEY:
             st.error("❌ Нет ключа Deepgram. Добавьте DEEPGRAM_API_KEY в Secrets (Streamlit Cloud) или env.")
             st.stop()
-
         dg = Deepgram(DG_KEY)
 
+        # Подготовим mimetype
+        name_lower = up.name.lower()
+        if name_lower.endswith(".wav"):
+            mimetype = "audio/wav"
+        elif name_lower.endswith(".mp3"):
+            mimetype = "audio/mpeg"
+        elif name_lower.endswith(".m4a"):
+            mimetype = "audio/m4a"
+        elif name_lower.endswith(".ogg"):
+            mimetype = "audio/ogg"
+        elif name_lower.endswith(".mp4"):
+            mimetype = "video/mp4"
+        elif name_lower.endswith(".mkv"):
+            mimetype = "video/x-matroska"
+        else:
+            # последний шанс
+            mimetype = up.type or "application/octet-stream"
+
         with st.spinner("Распознаём в Deepgram…"):
-            with open(wav_path, "rb") as f:
-                source = {"buffer": f, "mimetype": "audio/wav"}
+            source = {"buffer": io.BytesIO(up.getvalue()), "mimetype": mimetype}
+            try:
                 res = dg.transcription.sync_prerecorded(
                     source,
-                    {"punctuate": True, "smart_format": True, "language": "ru"}  # можно "auto" если будет много EN
+                    {
+                        "punctuate": True,
+                        "smart_format": True,
+                        # можно "auto", но для русских записей лучше "ru"
+                        "language": "ru",
+                    },
                 )
+            except Exception as e:
+                st.error(f"Deepgram error: {e}")
+                st.stop()
 
-        transcript = res["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
+        # Безопасно достанем транскрипт
+        transcript = ""
+        try:
+            transcript = (
+                res.get("results", {})
+                   .get("channels", [{}])[0]
+                   .get("alternatives", [{}])[0]
+                   .get("transcript", "")
+                   .strip()
+            )
+        except Exception:
+            transcript = ""
+
+        if not transcript:
+            st.error(f"Не удалось получить текст из ответа Deepgram: {json.dumps(res)[:600]}")
+            st.stop()
+
         st.session_state["transcript"] = transcript
 
         # Извлечение задач через NLI
@@ -247,7 +245,6 @@ if "tasks" in st.session_state:
     else:
         st.info("Не нашёл явных поручений. Сформулируйте фразы с глаголами действия.")
 
-    # ===== Jira =====
     st.divider()
     st.subheader("📤 Отправка задач в Jira")
     with st.form("jira_form"):
