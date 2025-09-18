@@ -34,8 +34,8 @@ yaml
 ## 🚀 Запуск
 1. Клонировать проект:
    ```bash
-   git clone https://github.com/your-org/ai-secretary.git
-   cd ai-secretary
+   git clone https://github.com/kana215/jiratasker
+   cd jiratasker
 Установить зависимости:
 
 bash
